@@ -17,6 +17,9 @@ import logging
 import json
 import ast
 
+import time
+import urllib
+
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller import dpset
@@ -36,6 +39,11 @@ from ryu.lib import ofctl_v1_5
 from ryu.app.wsgi import ControllerBase
 from ryu.app.wsgi import Response
 from ryu.app.wsgi import WSGIApplication
+
+from ryu.lib import dpid as dpid_lib
+from ryu.topology.api import get_switch, get_link, get_host
+
+from pprint import pprint
 
 LOG = logging.getLogger('ryu.app.ofctl_rest')
 
@@ -192,6 +200,87 @@ class PortNotFoundError(RyuException):
     message = 'No such port info: %(port_no)s'
 
 
+def sdn_method(method):
+    def wrapper(self, req, *args, **kwargs):
+        param_list = []
+        if "QUERY_STRING" in req.environ:
+            query_string = req.environ["QUERY_STRING"]
+            param_list = dict(urllib.parse.parse_qsl(query_string))
+
+        dpid_list = list(self.dpset.dps.keys()) if "dpid" not in param_list \
+            else [int(str(param_list["dpid"]),16)]
+        port = None if "port" not in param_list else param_list["port"]
+        bandwidth_list = list()
+
+        t1 = dict()
+        t2 = dict()
+        # Invoke StatsController method
+        try:
+            #t1 = method(self, req, dp, ofctl, port, **kwargs)
+            for dpid in dpid_list:
+                temp = get_dpid_port_status(self, req, port, method, dpid, **kwargs)
+                t1[dpid] = temp.get(str(dpid), None)
+            time.sleep(1)
+            #t2 = method(self, req, dp, ofctl, port, **kwargs)
+            for dpid in dpid_list:
+                temp = get_dpid_port_status(self, req, port, method, dpid, **kwargs)
+                t2[dpid] = temp.get(str(dpid), None)
+
+            bandwidth_list = calculate_bandwidth(t1, t2)
+            return Response(content_type='application/json',
+                            body=json.dumps(bandwidth_list))
+        except ValueError:
+            LOG.exception('Invalid syntax: %s', req.body)
+            return Response(status=400)
+        except AttributeError:
+            LOG.exception('Unsupported OF request in this version: %s',
+                          dp.ofproto.OFP_VERSION)
+            return Response(status=501)
+
+    return wrapper
+
+def get_dpid_port_status(self, req, port, method, dpid, **kwargs):
+    # Get datapath instance from DPSet
+    try:
+        dp = self.dpset.get(dpid)
+    except ValueError:
+        LOG.exception('Invalid dpid: %s', dpid)
+        return
+    if dp is None:
+        LOG.error('No such Datapath: %s', dpid)
+        return
+
+    # Get lib/ofctl_* module
+    try:
+        ofctl = supported_ofctl.get(dp.ofproto.OFP_VERSION)
+    except KeyError:
+        LOG.exception('Unsupported OF version: %s',
+                      dp.ofproto.OFP_VERSION)
+        return
+    return method(self, req, dp, ofctl, port, **kwargs)
+
+def calculate_bandwidth(bandwidth_t1, bandwidth_t2):
+    bandwidth_list = list()
+    for dpid in bandwidth_t1:
+        dpid_dict = {
+            'dpid'       : dpid,
+            'portstatus' : list()
+        }
+        for port_status_t1 in bandwidth_t1[dpid]:
+            if port_status_t1['port_no'] != "LOCAL":
+                for port_status_t2 in bandwidth_t2[dpid]:
+                    if port_status_t2['port_no'] != "LOCAL" and port_status_t1['port_no'] == port_status_t2['port_no']:
+                        dpid_dict["portstatus"].append(
+                            {
+                                'port'  : port_status_t1['port_no'],
+                                'tx'    : str(int((port_status_t2['tx_bytes'] - port_status_t1['tx_bytes']) / 128)),
+                                'rx'    : str(int((port_status_t2['rx_bytes'] - port_status_t1['rx_bytes']) / 128)),
+                            }
+                        )
+                        break
+        bandwidth_list.append(dpid_dict)
+    return bandwidth_list
+
 def stats_method(method):
     def wrapper(self, req, dpid, *args, **kwargs):
         # Get datapath instance from DPSet
@@ -297,11 +386,26 @@ class StatsController(ControllerBase):
         super(StatsController, self).__init__(req, link, data, **config)
         self.dpset = data['dpset']
         self.waiters = data['waiters']
+        self.topology_api_app = data['topology_api_app']
+    
+    def to_dict(self, link):
+        return {'src' : {'dpid' : str(format(link.src.dpid, "x")),'port':str(link.src.port_no)},
+                'dst' : {'dpid' : str(format(link.dst.dpid, "x")),'port':str(link.dst.port_no)}}
 
     def get_dpids(self, req, **_kwargs):
         dps = list(self.dpset.dps.keys())
         body = json.dumps(dps)
         return Response(content_type='application/json', body=body)
+
+    def get_topology(self, req, **kwargs):
+        time.sleep(1)
+        links_list = get_link(self.topology_api_app, None)
+        body = json.dumps({"links" : [self.to_dict(link) for link in links_list]})
+        return Response(content_type='application/json', body=body)
+
+    @sdn_method
+    def get_linkbandwidth(self, req, dp, ofctl, port=None, **kwargs):
+        return ofctl.get_port_stats(dp, self.waiters, port)
 
     @stats_method
     def get_desc_stats(self, req, dp, ofctl, **kwargs):
@@ -518,9 +622,21 @@ class RestStatsApi(app_manager.RyuApp):
         self.data = {}
         self.data['dpset'] = self.dpset
         self.data['waiters'] = self.waiters
+        self.data['topology_api_app'] = self
         mapper = wsgi.mapper
 
         wsgi.registory['StatsController'] = self.data
+        
+        uri = '/topology'
+        mapper.connect('stats', uri,
+                       controller=StatsController, action='get_topology',
+                       conditions=dict(method=['GET']))
+
+        uri = '/linkbandwidth'
+        mapper.connect('stats', uri,
+                       controller=StatsController, action='get_linkbandwidth',
+                       conditions=dict(method=['GET']))
+
         path = '/stats'
         uri = path + '/switches'
         mapper.connect('stats', uri,

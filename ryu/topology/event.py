@@ -87,6 +87,19 @@ class EventSwitchReply(event.EventReplyBase):
         super(EventSwitchReply, self).__init__(dst)
         self.switches = switches
 
+
+class EventDeleteHostsRequest(event.EventRequestBase):
+    def __init__(self, host_mac):
+        super(EventInitHostsReply, self).__init__(dst)
+        self.dst = 'switches'
+        self.host_mac = host_mac
+
+
+class EventDeletHostReply(event.EventReplyBase):
+    def __init__(self, dst,state = False):
+        super(EventInitHostsReply, self).__init__(dst)
+        self.state = state
+
     def __str__(self):
         return 'EventSwitchReply<dst=%s, %s>' % \
             (self.dst, self.switches)
@@ -109,6 +122,20 @@ class EventLinkAdd(EventLinkBase):
 class EventLinkDelete(EventLinkBase):
     def __init__(self, link):
         super(EventLinkDelete, self).__init__(link)
+
+
+class EventLinkAddRequest(event.EventRequestBase):
+    # Directly add link to best performence
+    def __init__(self, link=None):
+        super(EventLinkAddRequest, self).__init__()
+        self.dst = 'BestPerformance'
+        self.link = link
+
+class EventLinkAddReply(event.EventReplyBase):
+    # return reply
+    def __init__(self, dst, result=None):
+        super(EventLinkAddReply, self).__init__(dst)
+        self.result = result
 
 
 class EventLinkRequest(event.EventRequestBase):

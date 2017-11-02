@@ -31,6 +31,7 @@ from ryu.lib.dpid import dpid_to_str, str_to_dpid
 from ryu.lib.port_no import port_no_to_str
 from ryu.lib.packet import packet, ethernet
 from ryu.lib.packet import lldp, ether_types
+from ryu.ofproto.ether import ETH_TYPE_IPV6
 from ryu.ofproto.ether import ETH_TYPE_LLDP
 from ryu.ofproto.ether import ETH_TYPE_CFM
 from ryu.ofproto import nx_match
@@ -195,6 +196,10 @@ class HostState(dict):
     def add(self, host):
         mac = host.mac
         self.setdefault(mac, host)
+
+    def delete(self, host_mac):
+        if host_mac in self:
+            del self[host_mac]
 
     def update_ip(self, host, ip_v4=None, ip_v6=None):
         mac = host.mac
@@ -522,6 +527,7 @@ class Switches(app_manager.RyuApp):
         self.links = LinkState()      # Link class -> timestamp
         self.hosts = HostState()      # mac address -> Host class list
         self.is_active = True
+        self.dpid_to_host = {}
 
         self.link_discovery = self.CONF.observe_links
         if self.link_discovery:
@@ -596,6 +602,11 @@ class Switches(app_manager.RyuApp):
 
         return True
 
+    def _delete_host_by_dpid(self, dpid):
+        if dpid in self.dpid_to_host:
+                for host_mac in self.dpid_to_host[dpid].values():
+                    self.hosts.delete(host_mac)
+
     @set_ev_cls(ofp_event.EventOFPStateChange,
                 [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def state_change_handler(self, ev):
@@ -616,6 +627,8 @@ class Switches(app_manager.RyuApp):
 
             if not dp_multiple_conns:
                 self.send_event_to_observers(event.EventSwitchEnter(switch))
+                if dp.id in self.dpid_to_host:
+                    self._delete_host_by_dpid(dp.id)
             else:
                 evt = event.EventSwitchReconnected(switch)
                 self.send_event_to_observers(evt)
@@ -673,6 +686,8 @@ class Switches(app_manager.RyuApp):
             if dp.id is None:
                 return
 
+            self._delete_host_by_dpid(dp.id)
+
             switch = self._get_switch(dp.id)
             if switch:
                 if switch.dp is dp:
@@ -717,7 +732,6 @@ class Switches(app_manager.RyuApp):
             # LOG.debug('A port was deleted.' +
             #           '(datapath id = %s, port number = %s)',
             #           dp.id, ofpport.port_no)
-            self.port_state[dp.id].remove(ofpport.port_no)
             self.send_event_to_observers(
                 event.EventPortDelete(Port(dp.id, dp.ofproto, ofpport)))
 
@@ -730,6 +744,7 @@ class Switches(app_manager.RyuApp):
                 self._link_down(port)
                 self.lldp_event.set()
 
+            self.port_state[dp.id].remove(ofpport.port_no)
         else:
             assert reason == dp.ofproto.OFPPR_MODIFY
             # LOG.debug('A port was modified.' +
@@ -814,7 +829,9 @@ class Switches(app_manager.RyuApp):
 
         link = Link(src, dst)
         if link not in self.links:
+            LOG.info('New link : %s connect to %s',src_dpid, dst_dpid)
             self.send_event_to_observers(event.EventLinkAdd(link))
+            self.send_request(event.EventLinkAddRequest(link))
 
             # remove hosts if it's not attached to edge port
             host_to_del = []
@@ -839,7 +856,7 @@ class Switches(app_manager.RyuApp):
         eth, pkt_type, pkt_data = ethernet.ethernet.parser(msg.data)
 
         # ignore lldp and cfm packets
-        if eth.ethertype in (ETH_TYPE_LLDP, ETH_TYPE_CFM):
+        if eth.ethertype in (ETH_TYPE_LLDP, ETH_TYPE_CFM, ETH_TYPE_IPV6):
             return
 
         datapath = msg.datapath
@@ -862,9 +879,11 @@ class Switches(app_manager.RyuApp):
 
         host_mac = eth.src
         host = Host(host_mac, port)
+        self.dpid_to_host.setdefault(dpid, {})
 
         if host_mac not in self.hosts:
             self.hosts.add(host)
+            self.dpid_to_host[dpid][str(port_no)] = host_mac
             ev = event.EventHostAdd(host)
             self.send_event_to_observers(ev)
 
@@ -883,6 +902,19 @@ class Switches(app_manager.RyuApp):
             # TODO: need to handle NDP
             ipv6_pkt, _, _ = pkt_type.parser(pkt_data)
             self.hosts.update_ip(host, ip_v6=ipv6_pkt.src)
+
+        """
+        @set_ev_cls(event.EventDeleteHostsRequest)
+        def delete_host_handler(self, req):
+            host_mac = req.host_mac
+            state = False
+            if host_mac in self.hosts:
+                del self.hosts[host_mac]
+                state = True
+
+            rep = event.EventDeletHostReply(req.src, state)
+            self.reply_to_request(req, rep)
+        """
 
     def send_lldp_packet(self, port):
         try:
